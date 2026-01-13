@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:block/cross",
+  "textures": {
+    "cross": "kingdomswar:block/kingdom_flag"
+  }
+}
