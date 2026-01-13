@@ -4,317 +4,439 @@ import com.vladisss.kingdomswar.entity.GuardEntity;
 import com.vladisss.kingdomswar.entity.KnightEntity;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.monster.Monster;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
+import java.util.*;
 
+/**
+ * ОПТИМИЗИРОВАННАЯ СИСТЕМА AI КОРОЛЕВСТВА
+ * 
+ * Приоритеты:
+ * 1. ЗАЩИТА КОРОЛЯ (главная задача)
+ * 2. РАСШИРЕНИЕ ТЕРРИТОРИИ (пассивный доход)
+ * 3. АДАПТИВНАЯ ОБОРОНА (все войска при угрозе)
+ */
 public class KingdomAI {
     private static final Logger LOGGER = LoggerFactory.getLogger("KingdomsWar");
-
-    public enum Strategy {
-        PEACEFUL,      // Мирное развитие
-        AGGRESSIVE,    // Агрессивное расширение
-        DEFENSIVE,     // Оборона замка
-        EXPANSIONIST   // Захват территории
+    
+    // ==================== КОНСТАНТЫ ====================
+    private static final int CASTLE_DETECTION_RADIUS = 16;  // Радиус видимости замка
+    private static final int CRITICAL_THREAT_RADIUS = 32;   // Радиус критической угрозы
+    private static final int GUARD_MAX_DISTANCE = 5;        // Стражники не убегают дальше 5 блоков от замка
+    private static final int KNIGHT_MAX_DISTANCE = 5;       // Рыцари не уходят дальше 5 блоков от границы территории
+    
+    private static final int MAX_ATTACKERS_PER_TARGET = 3;  // Максимум атакующих на одну цель
+    private static final int THREAT_CHECK_INTERVAL = 100;   // Проверка угроз каждые 5 секунд
+    
+    // ==================== СОСТОЯНИЕ ====================
+    public enum ThreatLevel {
+        NONE,           // Нет угроз - можно расширяться
+        LOW,            // Низкая угроза - патруль
+        MEDIUM,         // Средняя угроза - усиленная оборона
+        CRITICAL        // Критическая угроза - ВСЕ ВОЙСКА НА ЗАЩИТУ!
     }
-
-    private Strategy currentStrategy = Strategy.PEACEFUL;
-    private int threatLevel = 0;
+    
+    private ThreatLevel currentThreatLevel = ThreatLevel.NONE;
     private long lastThreatCheck = 0;
     private long lastOptimization = 0;
-    private long lastStrategyChange = 0; // ✅ НОВОЕ: запоминаем когда меняли стратегию
-
-    // ✅ Оценка ситуации + оптимизация рыцарей
+    
+    // Карта атакующих: цель -> список атакующих
+    private Map<UUID, Set<UUID>> targetAssignments = new HashMap<>();
+    
+    // ==================== ГЛАВНЫЙ ЦИКЛ AI ====================
+    
+    /**
+     * Главный метод AI - вызывается каждый тик
+     */
     public void evaluateSituation(ServerLevel level, KingdomTerritory kingdom) {
         long currentTime = level.getGameTime();
-
-        // ✅ Проверяем угрозу каждые 10 секунд (было 5)
-        if (currentTime - lastThreatCheck >= 200) {
-            lastThreatCheck = currentTime;
+        
+        // 1. Обновляем оценку угрозы каждые 5 секунд
+        if (currentTime - lastThreatCheck >= THREAT_CHECK_INTERVAL) {
             updateThreatLevel(level, kingdom);
+            lastThreatCheck = currentTime;
         }
-
-        // Оптимизируем распределение рыцарей каждые 5 минут
-        if (currentTime - lastOptimization >= 6000) {
-            optimizeKnightDistribution(level, kingdom);
+        
+        // 2. Управляем войсками в зависимости от угрозы
+        manageTroops(level, kingdom);
+        
+        // 3. Оптимизируем распределение войск каждые 10 секунд
+        if (currentTime - lastOptimization >= 200) {
+            optimizeTroopPositions(level, kingdom);
             lastOptimization = currentTime;
         }
     }
-
-    // ✅ УЛУЧШЕННАЯ логика смены стратегии с гистерезисом
+    
+    // ==================== СИСТЕМА ОБНАРУЖЕНИЯ УГРОЗ ====================
+    
+    /**
+     * Обновление уровня угрозы для королевства
+     */
     private void updateThreatLevel(ServerLevel level, KingdomTerritory kingdom) {
-        int nearbyMonsters = countNearbyMonsters(level, kingdom);
-        int troops = kingdom.countLivingTroops(level);
-        int required = kingdom.getRequiredTroopsCount();
-        int points = kingdom.getPoints();
-        int knights = kingdom.countKnights(level);
-
-        // Расчет уровня угрозы (0-100)
-        threatLevel = (nearbyMonsters * 3);
-        if (troops < required) {
-            threatLevel += (required - troops) * 2;
+        BlockPos castleCenter = kingdom.getCastleCenter();
+        int territoryRadius = kingdom.getRadius();
+        
+        // Ищем всех потенциальных врагов в зоне видимости замка (16 блоков)
+        List<LivingEntity> nearCastleThreats = findThreatsInRadius(level, castleCenter, CASTLE_DETECTION_RADIUS);
+        
+        // Ищем врагов в критической зоне (32 блока)
+        List<LivingEntity> criticalThreats = findThreatsInRadius(level, castleCenter, CRITICAL_THREAT_RADIUS);
+        
+        // Ищем врагов на территории
+        List<LivingEntity> territoryThreats = findThreatsInRadius(level, castleCenter, territoryRadius);
+        
+        // Определяем уровень угрозы
+        ThreatLevel oldLevel = currentThreatLevel;
+        
+        if (!nearCastleThreats.isEmpty()) {
+            // КРИТИЧЕСКАЯ УГРОЗА: враги у самого замка!
+            currentThreatLevel = ThreatLevel.CRITICAL;
+        } else if (!criticalThreats.isEmpty()) {
+            // СРЕДНЯЯ УГРОЗА: враги близко к замку
+            currentThreatLevel = ThreatLevel.MEDIUM;
+        } else if (!territoryThreats.isEmpty()) {
+            // НИЗКАЯ УГРОЗА: враги на территории
+            currentThreatLevel = ThreatLevel.LOW;
+        } else {
+            // НЕТ УГРОЗ
+            currentThreatLevel = ThreatLevel.NONE;
         }
-        threatLevel = Math.min(100, threatLevel);
-
-        Strategy oldStrategy = currentStrategy;
-        long currentTime = level.getGameTime();
-
-        // ✅ ГИСТЕРЕЗИС: не меняем стратегию чаще чем раз в 1 минуту (1200 тиков)
-        boolean canChangeStrategy = (currentTime - lastStrategyChange) > 1200;
-
-        // ✅ НОВАЯ ЛОГИКА: Приоритет на экономический рост
-        if (threatLevel > 70) {
-            // КРИТИЧЕСКАЯ УГРОЗА → немедленно защищаемся
-            currentStrategy = Strategy.DEFENSIVE;
-            canChangeStrategy = true; // Игнорируем гистерезис при угрозе
-        } else if (threatLevel > 40) {
-            // Средняя угроза → агрессивная оборона
-            if (canChangeStrategy) {
-                currentStrategy = Strategy.AGGRESSIVE;
-            }
-        } else if (threatLevel < 20) {
-            // ✅ МИРНОЕ ВРЕМЯ → развиваемся экономически!
-            if (points > 300 && knights >= required * 0.5) {
-                // Есть ресурсы И хоть какая-то оборона → ЭКСПАНСИЯ!
-                if (canChangeStrategy) {
-                    currentStrategy = Strategy.EXPANSIONIST;
-                }
-            } else {
-                // Мало ресурсов → мирное развитие
-                if (canChangeStrategy) {
-                    currentStrategy = Strategy.PEACEFUL;
-                }
-            }
-        }
-
-        if (oldStrategy != currentStrategy) {
-            lastStrategyChange = currentTime;
-            LOGGER.warn("[AI] {} изменила стратегию: {} -> {} (Угроза: {}, Войск: {}/{}, Очков: {})",
-                    kingdom.getName(), oldStrategy, currentStrategy, threatLevel, troops, required, points);
+        
+        // Логируем изменение уровня угрозы
+        if (oldLevel != currentThreatLevel) {
+            LOGGER.warn("[AI] {} - Уровень угрозы: {} -> {} (Врагов: у замка={}, критич={}, террит={}) ",
+                kingdom.getName(), oldLevel, currentThreatLevel,
+                nearCastleThreats.size(), criticalThreats.size(), territoryThreats.size());
         }
     }
-
-    private int countNearbyMonsters(ServerLevel level, KingdomTerritory kingdom) {
-        BlockPos center = kingdom.getCastleCenter();
-        int radius = kingdom.getRadius();
-        List<Monster> monsters = level.getEntitiesOfClass(Monster.class,
-                new AABB(
-                        center.offset(-radius, -50, -radius),
-                        center.offset(radius, 100, radius)
-                ),
-                monster -> monster.isAlive()
+    
+    /**
+     * Поиск угроз в указанном радиусе
+     */
+    private List<LivingEntity> findThreatsInRadius(ServerLevel level, BlockPos center, int radius) {
+        AABB searchArea = new AABB(
+            center.offset(-radius, -50, -radius),
+            center.offset(radius, 100, radius)
         );
-        return monsters.size();
+        
+        List<LivingEntity> threats = new ArrayList<>();
+        
+        // Ищем монстров
+        threats.addAll(level.getEntitiesOfClass(Monster.class, searchArea, 
+            monster -> monster.isAlive()));
+        
+        // TODO: Когда добавите дипломатию, здесь будет проверка враждебности игроков
+        // Пока считаем всех игроков нейтральными
+        // threats.addAll(level.getEntitiesOfClass(Player.class, searchArea,
+        //     player -> kingdom.isHostile(player)));
+        
+        return threats;
     }
-
-    // ✅ КАРДИНАЛЬНО ПЕРЕРАБОТАННАЯ ЛОГИКА НАЙМА С ЗАЩИТОЙ РЕЗЕРВА
-    public void smartRecruit(ServerLevel level, KingdomTerritory kingdom) {
-        int troops = kingdom.countLivingTroops(level);
-        int required = kingdom.getRequiredTroopsCount();
-        int points = kingdom.getPoints();
-        int knights = kingdom.countKnights(level);
-        int guards = kingdom.countGuards(level);
-
-        // ========================================
-        // 1. КРИТИЧЕСКАЯ ЭКСТРЕННАЯ ОБОРОНА (используем резерв!)
-        // ========================================
-        if (troops < required * 0.3 && points >= 70) {
-            // Королевство в ОПАСНОСТИ! Тратим даже последние очки!
-            LOGGER.error("[AI] ⚠️ {} КРИТИЧЕСКАЯ СИТУАЦИЯ! Войск: {}/{} - покупаем ЛЮБОЙ ценой!",
-                    kingdom.getName(), troops, required);
-
-            // Покупаем рыцарей (сильнее стражников)
-            if (points >= 70) {
-                kingdom.recruitKnight(level);
-                LOGGER.error("[AI] {} экстренный найм РЫЦАРЯ из резерва!", kingdom.getName());
-                return;
-            }
-        }
-
-        // ========================================
-        // 2. ЭКСТРЕННАЯ ОБОРОНА (нормальный режим)
-        // ========================================
-        if (troops < required * 0.5 && points >= 100) {
-            LOGGER.error("[AI] {} ЭКСТРЕННЫЙ НАЙМ! Войск: {}/{}",
-                    kingdom.getName(), troops, required);
-
-            // При экстренной обороне покупаем стражников (дешевле)
-            if (points >= 100) {
-                kingdom.recruitGuard(level);
-                return;
-            }
-        }
-
-        // ========================================
-        // 3. БАЗОВАЯ ОБОРОНА (до минимума)
-        // ========================================
-        if (troops < required) {
-            if (currentStrategy == Strategy.DEFENSIVE) {
-                // При обороне нужно больше стражников
-                if (guards < required * 0.6 && points >= 150) {
-                    kingdom.recruitGuard(level);
-                    return;
-                }
-            }
-
-            // Нанимаем рыцарей если есть очки
-            if (points >= 250) {
-                kingdom.recruitKnight(level);
-                LOGGER.info("[AI] {} нанимает рыцаря для базовой обороны", kingdom.getName());
-                return;
-            } else if (points >= 150) {
-                kingdom.recruitGuard(level);
-                return;
-            }
-        }
-
-        // ========================================
-        // 4. ✅ ЭКОНОМИЧЕСКИЙ РОСТ (КЛЮЧЕВОЕ ИЗМЕНЕНИЕ!)
-        // ========================================
-        // Если есть базовая оборона → ИНВЕСТИРУЕМ В РЫЦАРЕЙ!
-        if (troops >= required) {
-            if (currentStrategy == Strategy.EXPANSIONIST || currentStrategy == Strategy.PEACEFUL) {
-                // ✅ НОВАЯ ЛОГИКА: Покупаем рыцарей пока есть деньги!
-                int optimalKnights = calculateOptimalKnightCount(kingdom, level);
-
-                // ЗАЩИТА РЕЗЕРВА: оставляем минимум 100 очков на экстренный случай
-                int reserveFund = 100;
-
-                if (knights < optimalKnights && points >= 270) { // 200 (рыцарь) + 70 (резерв)
-                    kingdom.recruitKnight(level);
-                    LOGGER.info("[AI] {} ИНВЕСТИРУЕТ в рыцаря для территории ({}/{}, резерв: {})",
-                            kingdom.getName(), knights, optimalKnights, points - 70);
-                    return;
-                }
-
-                // Если рыцарей достаточно → создаем дополнительный резерв
-                if (points > 500 && knights < optimalKnights * 1.2) {
-                    kingdom.recruitKnight(level);
-                    LOGGER.info("[AI] {} создает РЕЗЕРВ рыцарей (очки: {})", kingdom.getName(), points);
-                    return;
-                }
-            }
-
-            // При агрессивной стратегии баланс 60/40
-            if (currentStrategy == Strategy.AGGRESSIVE) {
-                if (knights < troops * 0.6 && points >= 270) {
-                    kingdom.recruitKnight(level);
-                    return;
-                } else if (points >= 150 && guards < troops * 0.4) {
-                    kingdom.recruitGuard(level);
-                    return;
-                }
-            }
+    
+    // ==================== УПРАВЛЕНИЕ ВОЙСКАМИ ====================
+    
+    /**
+     * Управление войсками в зависимости от уровня угрозы
+     */
+    private void manageTroops(ServerLevel level, KingdomTerritory kingdom) {
+        BlockPos castleCenter = kingdom.getCastleCenter();
+        int territoryRadius = kingdom.getRadius();
+        
+        // Получаем всех войск
+        List<GuardEntity> guards = getGuards(level, castleCenter, territoryRadius);
+        List<KnightEntity> knights = getKnights(level, castleCenter, territoryRadius);
+        
+        switch (currentThreatLevel) {
+            case CRITICAL:
+                // ВСЕ ВОЙСКА К ЗАМКУ!
+                defendCastleAllForces(level, kingdom, guards, knights);
+                break;
+                
+            case MEDIUM:
+                // Усиленная оборона - распределяем умно
+                smartDefense(level, kingdom, guards, knights);
+                break;
+                
+            case LOW:
+                // Патрулирование территории
+                patrolTerritory(level, kingdom, guards, knights);
+                break;
+                
+            case NONE:
+                // Мирное время - расширение и патруль
+                peacefulExpansion(level, kingdom, guards, knights);
+                break;
         }
     }
-
-
-    // ✅ НОВЫЙ МЕТОД: Расчет оптимального количества рыцарей
-    private int calculateOptimalKnightCount(KingdomTerritory kingdom, ServerLevel level) {
-        int radius = kingdom.getRadius();
-
-        // Формула: 1 рыцарь на 20 блоков радиуса (для покрытия территории)
-        int baseKnights = radius / 20;
-
-        // Минимум 5 рыцарей, максимум 20
-        int optimal = Math.max(5, Math.min(20, baseKnights));
-
-        // Бонус при экспансии: +50%
-        if (currentStrategy == Strategy.EXPANSIONIST) {
-            optimal = (int)(optimal * 1.5);
+    
+    /**
+     * КРИТИЧЕСКАЯ ЗАЩИТА: Все войска защищают замок
+     */
+    private void defendCastleAllForces(ServerLevel level, KingdomTerritory kingdom, 
+                                       List<GuardEntity> guards, List<KnightEntity> knights) {
+        BlockPos castleCenter = kingdom.getCastleCenter();
+        
+        // Находим все угрозы в критической зоне
+        List<LivingEntity> threats = findThreatsInRadius(level, castleCenter, CRITICAL_THREAT_RADIUS);
+        
+        if (threats.isEmpty()) return;
+        
+        LOGGER.info("[AI] {} - КРИТИЧЕСКАЯ ЗАЩИТА! Все {} войск атакуют {} врагов",
+            kingdom.getName(), guards.size() + knights.size(), threats.size());
+        
+        // Приоритетные цели - ближайшие к замку
+        threats.sort(Comparator.comparingDouble(e -> e.distanceToSqr(castleCenter.getX(), castleCenter.getY(), castleCenter.getZ())));
+        
+        // Отправляем всех на ближайшие цели
+        int targetIndex = 0;
+        for (GuardEntity guard : guards) {
+            LivingEntity target = threats.get(targetIndex % threats.size());
+            guard.setTarget(target);
+            targetIndex++;
         }
-
-        LOGGER.debug("[AI] Оптимальное количество рыцарей для радиуса {}: {}", radius, optimal);
-        return optimal;
+        
+        for (KnightEntity knight : knights) {
+            LivingEntity target = threats.get(targetIndex % threats.size());
+            knight.setTarget(target);
+            targetIndex++;
+        }
     }
-
-
-
-    // ✅ Распределение рыцарей (без изменений)
-    public void optimizeKnightDistribution(ServerLevel level, KingdomTerritory kingdom) {
-        BlockPos center = kingdom.getCastleCenter();
-        int radius = kingdom.getRadius();
-        List<KnightEntity> knights = level.getEntitiesOfClass(
-                KnightEntity.class,
-                new AABB(
-                        center.offset(-radius, -50, -radius),
-                        center.offset(radius, 100, radius)
-                )
-        );
-
-        if (knights.isEmpty()) return;
-
-        int sectors = calculateOptimalSectors(knights.size());
-        LOGGER.info("[AI] {} оптимизирует {} рыцарей в {} секторов (стратегия: {})",
-                kingdom.getName(), knights.size(), sectors, currentStrategy);
-
-        for (int i = 0; i < knights.size(); i++) {
+    
+    /**
+     * УМНАЯ ЗАЩИТА: Распределяем войска группами по 2-3 человека
+     */
+    private void smartDefense(ServerLevel level, KingdomTerritory kingdom,
+                              List<GuardEntity> guards, List<KnightEntity> knights) {
+        BlockPos castleCenter = kingdom.getCastleCenter();
+        int territoryRadius = kingdom.getRadius();
+        
+        // Находим все угрозы на территории
+        List<LivingEntity> threats = findThreatsInRadius(level, castleCenter, territoryRadius);
+        
+        if (threats.isEmpty()) {
+            // Если нет угроз, возвращаемся к патрулю
+            patrolTerritory(level, kingdom, guards, knights);
+            return;
+        }
+        
+        // Очищаем старые назначения
+        targetAssignments.clear();
+        
+        // Приоритет: ближайшие к замку враги
+        threats.sort(Comparator.comparingDouble(e -> 
+            e.distanceToSqr(castleCenter.getX(), castleCenter.getY(), castleCenter.getZ())));
+        
+        // Распределяем стражников (они ближе к замку)
+        assignTroopsToTargets(guards, threats, castleCenter);
+        
+        // Распределяем рыцарей (они могут уходить дальше)
+        assignTroopsToTargets(knights, threats, castleCenter);
+    }
+    
+    /**
+     * Умное распределение войск по целям (макс 2-3 на цель)
+     */
+    private <T extends LivingEntity> void assignTroopsToTargets(List<T> troops, List<LivingEntity> threats,
+                                                                  BlockPos castleCenter) {
+        for (T troop : troops) {
+            // Находим подходящую цель
+            LivingEntity bestTarget = null;
+            double bestScore = Double.MAX_VALUE;
+            
+            for (LivingEntity threat : threats) {
+                // Проверяем, не слишком ли много уже атакует эту цель
+                int currentAttackers = targetAssignments.getOrDefault(threat.getUUID(), new HashSet<>()).size();
+                if (currentAttackers >= MAX_ATTACKERS_PER_TARGET) {
+                    continue; // Слишком много атакующих
+                }
+                
+                // Оценка: чем ближе к войску и к замку, тем лучше
+                double distanceToTroop = troop.distanceToSqr(threat);
+                double distanceToCastle = threat.distanceToSqr(castleCenter.getX(), castleCenter.getY(), castleCenter.getZ());
+                double score = distanceToTroop + distanceToCastle * 0.5; // Приоритет близости к замку
+                
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestTarget = threat;
+                }
+            }
+            
+            // Назначаем цель
+            if (bestTarget != null) {
+                troop.setTarget(bestTarget);
+                targetAssignments.computeIfAbsent(bestTarget.getUUID(), k -> new HashSet<>()).add(troop.getUUID());
+            }
+        }
+    }
+    
+    /**
+     * ПАТРУЛЬ ТЕРРИТОРИИ: Войска патрулируют свои зоны
+     */
+    private void patrolTerritory(ServerLevel level, KingdomTerritory kingdom,
+                                 List<GuardEntity> guards, List<KnightEntity> knights) {
+        // Рыцари патрулируют границы территории (уже управляется через optimizeTroopPositions)
+        // Стражники стоят у замка (уже управляется через optimizeTroopPositions)
+    }
+    
+    /**
+     * МИРНОЕ РАСШИРЕНИЕ: Фокус на росте территории
+     */
+    private void peacefulExpansion(ServerLevel level, KingdomTerritory kingdom,
+                                   List<GuardEntity> guards, List<KnightEntity> knights) {
+        // В мирное время просто патрулируем
+        patrolTerritory(level, kingdom, guards, knights);
+        
+        // Рыцари могут исследовать дальше для расширения
+        for (KnightEntity knight : knights) {
+            knight.setPatrolRadius(20); // Больший радиус патруля
+        }
+    }
+    
+    // ==================== ОПТИМИЗАЦИЯ ПОЗИЦИЙ ====================
+    
+    /**
+     * Оптимизация распределения войск
+     */
+    private void optimizeTroopPositions(ServerLevel level, KingdomTerritory kingdom) {
+        BlockPos castleCenter = kingdom.getCastleCenter();
+        int territoryRadius = kingdom.getRadius();
+        
+        List<GuardEntity> guards = getGuards(level, castleCenter, territoryRadius);
+        List<KnightEntity> knights = getKnights(level, castleCenter, territoryRadius);
+        
+        // Стражники - вокруг замка
+        distributeGuardsAroundCastle(guards, castleCenter);
+        
+        // Рыцари - по секторам территории
+        distributeKnightsInSectors(knights, castleCenter, territoryRadius);
+    }
+    
+    private void distributeGuardsAroundCastle(List<GuardEntity> guards, BlockPos castleCenter) {
+        int guardCount = guards.size();
+        if (guardCount == 0) return;
+        
+        for (int i = 0; i < guardCount; i++) {
+            GuardEntity guard = guards.get(i);
+            double angle = (2 * Math.PI * i) / guardCount;
+            int x = castleCenter.getX() + (int)(Math.cos(angle) * 8);
+            int z = castleCenter.getZ() + (int)(Math.sin(angle) * 8);
+            BlockPos guardPost = new BlockPos(x, castleCenter.getY(), z);
+            
+            // Устанавливаем пост стражника
+            guard.setGuardPos(guardPost);
+        }
+    }
+    
+    private void distributeKnightsInSectors(List<KnightEntity> knights, BlockPos castleCenter, int territoryRadius) {
+        int knightCount = knights.size();
+        if (knightCount == 0) return;
+        
+        int sectors = Math.min(knightCount, 8); // Максимум 8 секторов
+        
+        for (int i = 0; i < knightCount; i++) {
             KnightEntity knight = knights.get(i);
             double angle = (2 * Math.PI * i) / sectors;
-            double patrolDistance = calculatePatrolDistance(radius);
-            int offsetX = (int) (Math.cos(angle) * patrolDistance);
-            int offsetZ = (int) (Math.sin(angle) * patrolDistance);
-            BlockPos patrolPos = center.offset(offsetX, 0, offsetZ);
-
+            int patrolDistance = territoryRadius - 15; // Патрулируют у границы
+            int x = castleCenter.getX() + (int)(Math.cos(angle) * patrolDistance);
+            int z = castleCenter.getZ() + (int)(Math.sin(angle) * patrolDistance);
+            BlockPos patrolPos = new BlockPos(x, castleCenter.getY(), z);
+            
             knight.setPatrolCenter(patrolPos);
-            knight.setPatrolRadius(getPatrolRadiusForStrategy());
-
-            LOGGER.debug("[AI] Рыцарь {} -> сектор {} ({})",
-                    knight.getId(), i, patrolPos.toShortString());
+            knight.setPatrolRadius(15);
         }
     }
-
-    private int calculateOptimalSectors(int knightCount) {
-        if (currentStrategy == Strategy.DEFENSIVE) {
-            return Math.min(knightCount, 6);
-        } else if (currentStrategy == Strategy.EXPANSIONIST) {
-            return Math.min(knightCount, 12);
-        } else {
-            return Math.min(knightCount, 8);
+    
+    // ==================== НАЙМ ВОЙСК ====================
+    
+    /**
+     * Умный найм войск
+     */
+    public void smartRecruit(ServerLevel level, KingdomTerritory kingdom) {
+        int points = kingdom.getPoints();
+        int guards = kingdom.countGuards(level);
+        int knights = kingdom.countKnights(level);
+        int totalTroops = guards + knights;
+        int territoryRadius = kingdom.getRadius();
+        
+        // Минимальное количество войск для защиты
+        int minGuards = 4; // Минимум 4 стражника у замка
+        int optimalKnights = Math.max(3, territoryRadius / 30); // 1 рыцарь на 30 блоков радиуса
+        
+        // КРИТИЧЕСКАЯ СИТУАЦИЯ: нанимаем любой ценой
+        if (currentThreatLevel == ThreatLevel.CRITICAL && totalTroops < 5) {
+            if (points >= 50) { // Минимальная цена
+                kingdom.recruitGuard(level);
+                LOGGER.warn("[AI] {} - ЭКСТРЕННЫЙ НАЙМ! Критическая угроза!", kingdom.getName());
+                return;
+            }
+        }
+        
+        // ПРИОРИТЕТ 1: Минимальная защита замка
+        if (guards < minGuards && points >= 100) {
+            kingdom.recruitGuard(level);
+            LOGGER.info("[AI] {} - нанимает стражника для защиты замка ({}/{})", 
+                kingdom.getName(), guards + 1, minGuards);
+            return;
+        }
+        
+        // ПРИОРИТЕТ 2: Рыцари для патруля территории
+        if (knights < optimalKnights && points >= 200) {
+            kingdom.recruitKnight(level);
+            LOGGER.info("[AI] {} - нанимает рыцаря для территории ({}/{})", 
+                kingdom.getName(), knights + 1, optimalKnights);
+            return;
+        }
+        
+        // ПРИОРИТЕТ 3: Дополнительные войска при достатке очков
+        if (points >= 500) {
+            // Баланс 50/50 между стражниками и рыцарями
+            if (guards < knights && points >= 100) {
+                kingdom.recruitGuard(level);
+            } else if (points >= 200) {
+                kingdom.recruitKnight(level);
+            }
         }
     }
-
-    private double calculatePatrolDistance(int territoryRadius) {
-        switch (currentStrategy) {
-            case DEFENSIVE:
-                return territoryRadius * 0.5;
-            case EXPANSIONIST:
-            case AGGRESSIVE:
-                return territoryRadius * 0.8;
-            case PEACEFUL:
-            default:
-                return territoryRadius * 0.7;
-        }
+    
+    // ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
+    
+    private List<GuardEntity> getGuards(ServerLevel level, BlockPos center, int radius) {
+        return level.getEntitiesOfClass(GuardEntity.class,
+            new AABB(center.offset(-radius, -50, -radius), center.offset(radius, 100, radius)),
+            guard -> guard.isAlive()
+        );
     }
-
-    private int getPatrolRadiusForStrategy() {
-        switch (currentStrategy) {
-            case DEFENSIVE:
-                return 12;
-            case EXPANSIONIST:
-                return 20;
-            default:
-                return 15;
-        }
+    
+    private List<KnightEntity> getKnights(ServerLevel level, BlockPos center, int radius) {
+        return level.getEntitiesOfClass(KnightEntity.class,
+            new AABB(center.offset(-radius, -50, -radius), center.offset(radius, 100, radius)),
+            knight -> knight.isAlive()
+        );
     }
-
+    
+    /**
+     * Проверка, должно ли королевство расширяться
+     */
     public boolean shouldExpand(KingdomTerritory kingdom, ServerLevel level) {
-        int troops = kingdom.countLivingTroops(level);
-        int required = kingdom.getRequiredTroopsCount();
-        return currentStrategy == Strategy.EXPANSIONIST
-                && troops >= required * 1.2
-                && threatLevel < 40
-                && kingdom.getPoints() > kingdom.getExpansionCost() + 300;
+        // Расширяемся только в мирное время и при достатке ресурсов
+        return currentThreatLevel == ThreatLevel.NONE 
+            && kingdom.getPoints() > 300
+            && kingdom.countKnights(level) >= 3; // Минимум 3 рыцаря для патруля
     }
-
-    public Strategy getCurrentStrategy() {
-        return currentStrategy;
+    
+    // ==================== ГЕТТЕРЫ ====================
+    
+    public ThreatLevel getCurrentThreatLevel() {
+        return currentThreatLevel;
     }
-
-    public int getThreatLevel() {
-        return threatLevel;
+    
+    // Для совместимости со старым кодом
+    public void optimizeKnightDistribution(ServerLevel level, KingdomTerritory kingdom) {
+        optimizeTroopPositions(level, kingdom);
     }
 }
