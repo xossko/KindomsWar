@@ -1,0 +1,8 @@
+Manifest-Version: 1.0
+Specification-Title: kingdomswar
+Specification-Vendor: vladisss
+Specification-Version: 1
+Implementation-Title: kingdoms_war
+Implementation-Version: 1.0.1
+Implementation-Vendor: vladisss
+
