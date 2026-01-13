@@ -1,10 +1,6 @@
 package com.vladisss.kingdomswar.entity;
 
-import com.vladisss.kingdomswar.entity.ai.AvoidCrowdingGoal;
-import com.vladisss.kingdomswar.entity.ai.GuardReturnToPostGoal;
-import com.vladisss.kingdomswar.entity.ai.SmartTargetGoal; // ✅ ДОБАВЛЕНО
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
@@ -26,24 +22,32 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.ServerLevelAccessor;
-import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.util.RandomSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+/**
+ * СТРАЖНИК - ЗАЩИТНИК ЗАМКА
+ * 
+ * Функции:
+ * - Стоит на посту вокруг замка
+ * - НЕ УХОДИТ ДАЛЬШЕ 5 БЛОКОВ от замка
+ * - Атакует цели, назначенные KingdomAI
+ * - Возвращается на пост после боя
+ */
 public class GuardEntity extends PathfinderMob {
     private static final Logger LOGGER = LoggerFactory.getLogger("KingdomsWar");
+    
     private static final EntityDataAccessor<Integer> VARIANT =
             SynchedEntityData.defineId(GuardEntity.class, EntityDataSerializers.INT);
 
-    private BlockPos homePosition;
-    private GuardReturnToPostGoal returnToPostGoal;
-
-    // ✅ Ломание блоков при застревании
-    private int stuckBreakTimer = 0;
-    private BlockPos lastTickPos = null;
+    // Позиция поста стражника
+    private BlockPos guardPost;
+    
+    // МАКСИМАЛЬНОЕ РАССТОЯНИЕ ОТ ПОСТА
+    private static final int MAX_DISTANCE_FROM_POST = 5;
 
     public GuardEntity(EntityType<? extends PathfinderMob> type, Level level) {
         super(type, level);
@@ -53,105 +57,26 @@ public class GuardEntity extends PathfinderMob {
     @Override
     public void tick() {
         super.tick();
-        if (!level().isClientSide && level() instanceof ServerLevel) {
-            tryBreakBlockIfStuck(); // ✅ Система ломания блоков
-        }
-    }
-
-    // ✅ Ломает блоки если застрял
-    private void tryBreakBlockIfStuck() {
-        // Проверяем только если активно двигаемся куда-то
-        if (!this.getNavigation().isInProgress()) {
-            stuckBreakTimer = 0;
-            lastTickPos = null;
-            return;
-        }
-
-        BlockPos currentPos = this.blockPosition();
-
-        // Проверяем застревание - если не двигаемся
-        if (lastTickPos != null && currentPos.equals(lastTickPos)) {
-            // Двигаемся? (скорость > 0.01)
-            double movementSpeed = this.getDeltaMovement().horizontalDistance();
-            if (movementSpeed < 0.01) {
-                stuckBreakTimer++;
-
-                // Застряли на 2+ секунды (40 тиков)
-                if (stuckBreakTimer > 40) {
-                    // Определяем направление движения
-                    Direction direction = this.getDirection();
-                    BlockPos frontPos = currentPos.relative(direction);
-                    BlockPos upperPos = frontPos.above();
-
-                    if (level() instanceof ServerLevel level) {
-                        boolean brokeBlock = false;
-
-                        // Проверяем нижний блок
-                        BlockState frontState = level.getBlockState(frontPos);
-                        if (canBreakBlock(level, frontPos, frontState)) {
-                            level.destroyBlock(frontPos, false);
-                            brokeBlock = true;
-                            LOGGER.info("Guard #{} пробил {} на пути",
-                                    this.getId(), frontState.getBlock().getName().getString());
-                        }
-
-                        // Проверяем верхний блок (для 2-блочного прохода)
-                        BlockState upperState = level.getBlockState(upperPos);
-                        if (canBreakBlock(level, upperPos, upperState)) {
-                            level.destroyBlock(upperPos, false);
-                            brokeBlock = true;
-                            LOGGER.info("Guard #{} пробил {} сверху",
-                                    this.getId(), upperState.getBlock().getName().getString());
-                        }
-
-                        if (brokeBlock) {
-                            // Сбрасываем таймер после успешного ломания
-                            stuckBreakTimer = 0;
-                            // Обновляем навигацию
-                            if (this.getTarget() != null) {
-                                this.getNavigation().moveTo(this.getTarget(), 1.2D);
-                            }
-                        }
+        
+        // Проверяем расстояние от поста
+        if (!level().isClientSide && guardPost != null) {
+            double distanceFromPost = this.distanceToSqr(guardPost.getX(), guardPost.getY(), guardPost.getZ());
+            
+            // Если ушли слишком далеко от поста
+            if (distanceFromPost > MAX_DISTANCE_FROM_POST * MAX_DISTANCE_FROM_POST) {
+                // Если нет цели - возвращаемся на пост
+                if (this.getTarget() == null) {
+                    this.getNavigation().moveTo(guardPost.getX(), guardPost.getY(), guardPost.getZ(), 1.0D);
+                } else {
+                    // Если есть цель, но она слишком далеко - отменяем атаку
+                    double targetDistance = this.getTarget().distanceToSqr(guardPost.getX(), guardPost.getY(), guardPost.getZ());
+                    if (targetDistance > (MAX_DISTANCE_FROM_POST + 10) * (MAX_DISTANCE_FROM_POST + 10)) {
+                        this.setTarget(null);
+                        this.getNavigation().moveTo(guardPost.getX(), guardPost.getY(), guardPost.getZ(), 1.0D);
                     }
                 }
-            } else {
-                // Двигаемся - сбрасываем таймер
-                stuckBreakTimer = 0;
             }
-        } else {
-            // Позиция изменилась - не застряли
-            stuckBreakTimer = 0;
         }
-
-        lastTickPos = currentPos;
-    }
-
-    // ✅ Проверка можно ли ломать блок
-    private boolean canBreakBlock(ServerLevel level, BlockPos pos, BlockState state) {
-        if (state.isAir()) {
-            return false;
-        }
-
-        // Получаем твердость блока
-        float destroySpeed = state.getDestroySpeed(level, pos);
-        // Ломаем только мягкие блоки (твердость < 1.0)
-        if (destroySpeed < 0 || destroySpeed > 1.0F) {
-            return false;
-        }
-
-        // Не ломаем ценные блоки (сундуки, печки и т.д.)
-        if (state.hasBlockEntity()) {
-            return false;
-        }
-
-        // Не ломаем двери и ворота
-        String blockName = state.getBlock().getName().getString().toLowerCase();
-        if (blockName.contains("door") || blockName.contains("gate") ||
-                blockName.contains("fence") || blockName.contains("wall")) {
-            return false;
-        }
-
-        return true;
     }
 
     @Override
@@ -168,11 +93,15 @@ public class GuardEntity extends PathfinderMob {
         this.entityData.set(VARIANT, variant);
     }
 
-    public void setHomePosition(BlockPos pos) {
-        this.homePosition = pos;
-        if (this.returnToPostGoal != null) {
-            this.returnToPostGoal.setHomePosition(pos);
-        }
+    /**
+     * Установить пост стражника (вызывается из KingdomAI)
+     */
+    public void setGuardPos(BlockPos pos) {
+        this.guardPost = pos;
+    }
+    
+    public BlockPos getGuardPos() {
+        return guardPost;
     }
 
     @Override
@@ -188,71 +117,125 @@ public class GuardEntity extends PathfinderMob {
     public void addAdditionalSaveData(CompoundTag compound) {
         super.addAdditionalSaveData(compound);
         compound.putInt("Variant", this.getVariant());
+        if (guardPost != null) {
+            compound.putInt("PostX", guardPost.getX());
+            compound.putInt("PostY", guardPost.getY());
+            compound.putInt("PostZ", guardPost.getZ());
+        }
     }
 
     @Override
     public void readAdditionalSaveData(CompoundTag compound) {
         super.readAdditionalSaveData(compound);
         this.setVariant(compound.getInt("Variant"));
+        if (compound.contains("PostX")) {
+            this.guardPost = new BlockPos(
+                compound.getInt("PostX"),
+                compound.getInt("PostY"),
+                compound.getInt("PostZ")
+            );
+        }
     }
 
     public static AttributeSupplier.Builder createAttributes() {
         return Mob.createMobAttributes()
                 .add(Attributes.MAX_HEALTH, 25.0D)
-                .add(Attributes.ARMOR, 15.0D)        // ✅ Улучшено с 10.0
+                .add(Attributes.ARMOR, 15.0D)
                 .add(Attributes.ATTACK_DAMAGE, 5.0D)
-                .add(Attributes.MOVEMENT_SPEED, 0.35D) // ✅ Улучшено с 0.30D
+                .add(Attributes.MOVEMENT_SPEED, 0.35D)
                 .add(Attributes.FOLLOW_RANGE, 48.0D);
     }
 
     @Override
     protected void registerGoals() {
+        // ==================== ПРОСТАЯ СИСТЕМА AI ====================
+        
+        // 0. Плавать
         this.goalSelector.addGoal(0, new FloatGoal(this));
+        
+        // 1. Атаковать цель (назначенную KingdomAI)
         this.goalSelector.addGoal(1, new MeleeAttackGoal(this, 1.2D, false));
-        this.returnToPostGoal = new GuardReturnToPostGoal(this, 1.0D, 15);
-        this.goalSelector.addGoal(2, this.returnToPostGoal);
-        this.goalSelector.addGoal(3, new AvoidCrowdingGoal(this, 3));
-        this.goalSelector.addGoal(4, new WaterAvoidingRandomStrollGoal(this, 0.6D, 5)); // ✅ Улучшено с 0.3D
-        this.goalSelector.addGoal(5, new LookAtPlayerGoal(this, Player.class, 8.0F));
-        this.goalSelector.addGoal(6, new RandomLookAroundGoal(this));
+        
+        // 2. Стоять на посту
+        this.goalSelector.addGoal(2, new GuardStandAtPostGoal(this));
+        
+        // 3. Смотреть на игроков
+        this.goalSelector.addGoal(3, new LookAtPlayerGoal(this, Player.class, 8.0F));
+        
+        // 4. Случайно смотреть вокруг
+        this.goalSelector.addGoal(4, new RandomLookAroundGoal(this));
 
-        // ПРИОРИТЕТ 1: Реагировать на атаку союзников МОМЕНТАЛЬНО!
+        // ==================== ЦЕЛИ ДЛЯ АТАКИ ====================
+        
+        // 1. Реагировать на атаку
         this.targetSelector.addGoal(1, new HurtByTargetGoal(this, GuardEntity.class, KnightEntity.class)
                 .setAlertOthers(GuardEntity.class, KnightEntity.class));
-
-        // ✅ ПРИОРИТЕТ 2: УМНАЯ АТАКА (вместо NearestAttackableTargetGoal)
-        this.targetSelector.addGoal(2, new SmartTargetGoal<>(
-                this,
-                Mob.class,
-                20, // Проверка каждые 20 тиков (1 сек)
-                true,
-                false,
-                (mob) -> {
-                    if (mob instanceof GuardEntity || mob instanceof KnightEntity) {
-                        return false;
-                    }
-
-                    if (mob.getType().getCategory() == net.minecraft.world.entity.MobCategory.MONSTER) {
-                        return true;
-                    }
-
-                    if (mob instanceof net.minecraft.world.entity.NeutralMob) {
-                        return ((net.minecraft.world.entity.NeutralMob) mob).isAngry();
-                    }
-
-                    return false;
+        
+        // Примечание: Остальные цели назначает KingdomAI через setTarget()
+    }
+    
+    /**
+     * AI Цель: Стоять на посту
+     */
+    private static class GuardStandAtPostGoal extends Goal {
+        private final GuardEntity guard;
+        private int standTimer = 0;
+        
+        public GuardStandAtPostGoal(GuardEntity guard) {
+            this.guard = guard;
+        }
+        
+        @Override
+        public boolean canUse() {
+            // Стоим на посту только если нет цели
+            return guard.getTarget() == null && guard.guardPost != null;
+        }
+        
+        @Override
+        public boolean canContinueToUse() {
+            return guard.getTarget() == null && guard.guardPost != null;
+        }
+        
+        @Override
+        public void start() {
+            standTimer = 0;
+        }
+        
+        @Override
+        public void tick() {
+            standTimer++;
+            
+            // Если далеко от поста - идем к нему
+            double distance = guard.distanceToSqr(guard.guardPost.getX(), guard.guardPost.getY(), guard.guardPost.getZ());
+            if (distance > 4.0) { // Дальше 2 блоков
+                guard.getNavigation().moveTo(guard.guardPost.getX(), guard.guardPost.getY(), guard.guardPost.getZ(), 1.0D);
+            } else {
+                // На посту - стоим
+                guard.getNavigation().stop();
+                
+                // Смотрим в сторону замка (от замка наружу)
+                if (standTimer % 100 == 0) {
+                    // Каждые 5 секунд поворачиваемся
+                    double angle = Math.atan2(
+                        guard.guardPost.getZ() - guard.getZ(),
+                        guard.guardPost.getX() - guard.getX()
+                    );
+                    guard.setYRot((float) Math.toDegrees(angle) - 90); // Смотрим от замка
                 }
-        ));
+            }
+        }
     }
 
     @Override
     protected void populateDefaultEquipmentSlots(RandomSource random, DifficultyInstance difficulty) {
+        // Пытаемся дать копье из Epic Fight
         ItemStack spear = new ItemStack(
                 net.minecraftforge.registries.ForgeRegistries.ITEMS.getValue(
                         new net.minecraft.resources.ResourceLocation("epicfight", "iron_spear")
                 )
         );
 
+        // Если нет Epic Fight - даем трезубец
         if (spear.isEmpty()) {
             spear = new ItemStack(Items.TRIDENT);
         }
@@ -263,6 +246,6 @@ public class GuardEntity extends PathfinderMob {
 
     @Override
     public boolean removeWhenFarAway(double distanceToClosestPlayer) {
-        return false;
+        return false; // Не исчезают
     }
 }
